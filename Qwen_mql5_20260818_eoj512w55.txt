@@ -1,0 +1,1625 @@
+//+------------------------------------------------------------------+
+//|                           MATRIX-cross-V4-TRUE-MTF-PATCH.mq5     |
+//|                        Corrective patch for true MTF architecture|
+//+------------------------------------------------------------------+
+#property copyright   "Rama Empire"
+#property version     "4.10"
+#property description "Corrective patch: locked Swing engine + true MTF + fixed structural regression."
+#property indicator_chart_window
+
+#property indicator_buffers 4
+#property indicator_plots   4
+
+#property indicator_label1  "Minor Buy"
+#property indicator_type1   DRAW_ARROW
+#property indicator_color1  clrLimeGreen
+#property indicator_width1  2
+
+#property indicator_label2  "Minor Sell"
+#property indicator_type2   DRAW_ARROW
+#property indicator_color2  clrDeepPink
+#property indicator_width2  2
+
+#property indicator_label3  "Major Buy"
+#property indicator_type3   DRAW_ARROW
+#property indicator_color3  clrAqua
+#property indicator_width3  3
+
+#property indicator_label4  "Major Sell"
+#property indicator_type4   DRAW_ARROW
+#property indicator_color4  clrOrangeRed
+#property indicator_width4  3
+
+//+------------------------------------------------------------------+
+//| Enums                                                            |
+//+------------------------------------------------------------------+
+enum ENUM_TREND_STATE
+{
+   TREND_UNKNOWN = 0,
+   TREND_SIDEWAYS,
+   TREND_TRANSITION,
+   TREND_WEAK_BULL,
+   TREND_WEAK_BEAR,
+   TREND_BULLISH,
+   TREND_BEARISH,
+   TREND_STRONG_BULL,
+   TREND_STRONG_BEAR,
+   TREND_REVERSAL_CANDIDATE
+};
+
+//+------------------------------------------------------------------+
+//| Structures                                                       |
+//+------------------------------------------------------------------+
+struct SwingPoint
+{
+   datetime time;
+   double   price;
+   int      type;      // 1 = Low/Buy, 2 = High/Sell
+   int      tfBar;     // target timeframe bar index
+   bool     major;
+};
+
+struct TrendState
+{
+   int      rawDir;
+   int      confirmedDir;
+   int      bullScore;
+   int      bearScore;
+   int      lastHighRel;
+   int      lastLowRel;
+   ENUM_TREND_STATE state;
+};
+
+struct RegressionState
+{
+   bool     valid;
+   int      activeDir;
+   datetime anchorTime;
+   datetime expansionTime;
+   double   anchorPrice;
+   double   expansionPrice;
+   double   slope;
+   double   intercept;
+   double   stdDev;
+   double   slopePointsPerBar;
+   int      slopeDir;
+};
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input group "=== Analysis Timeframe ==="
+input ENUM_TIMEFRAMES InpAnalysisTF              = PERIOD_CURRENT; // Primary Analysis Timeframe
+input int             InpMaxTargetBars           = 5000;           // Maximum Target TF Bars To Load
+input int             InpCalcIntervalSeconds     = 1;              // Minimum Calculation Interval Seconds
+input bool            InpStrictNoRepaint         = true;           // Use Only Closed Target Bars
+
+input group "=== Locked Swing Engine ==="
+input int             InpBase_MA1_Period         = 5;              // MA 1 Period
+input int             InpBase_MA1_Shift          = -4;             // MA 1 Manual Shift
+input ENUM_MA_METHOD  InpBase_MA1_Method         = MODE_SMMA;      // MA Method
+input ENUM_APPLIED_PRICE InpBase_MA1_Price       = PRICE_MEDIAN;   // MA Applied Price
+input int             InpBase_MA2_Period         = 5;              // MA 2 Period
+input int             InpBase_MA2_Shift          = 0;              // MA 2 Manual Shift
+input int             InpBase_BarsBefore         = 14;             // X: Confirmation Bars Before
+input int             InpBase_BarsAfter          = 4;              // Y: Confirmation Bars After
+
+input group "=== Major Swing Engine ==="
+input bool            InpUseMajorSwings          = true;           // Detect Major Swings
+input int             InpMajor_BarsBefore        = 28;             // Major X: Bars Before
+input int             InpMajor_BarsAfter         = 8;              // Major Y: Bars After
+
+input group "=== Structural Trend Engine ==="
+input bool            InpEnableTrend             = true;           // Enable Structural Trend Engine
+input int             InpTrendEventLookback      = 12;             // Structural Events To Evaluate
+input double          InpStructMinDistancePoints = 20.0;           // Minimum Structural Distance Points
+input int             InpWeakScore               = 2;              // Weak Trend Minimum Score
+input int             InpStrongScore             = 4;              // Strong Trend Minimum Score
+input int             InpDirectionMargin         = 1;              // Direction Score Margin
+input int             InpReversalScore           = 2;              // Reversal Minimum Score
+input int             InpReversalMargin          = 1;              // Reversal Score Margin
+input bool            InpRequireBothSidesForReversal = true;       // Require Both High/Low Reversal Evidence
+
+input group "=== Regression Validation Engine ==="
+input bool            InpEnableRegression        = true;           // Enable Regression Validation
+input int             InpRegressionMinBars       = 10;             // Minimum Regression Bars
+input int             InpRegressionMaxBars       = 2000;           // Maximum Regression Bars
+input ENUM_APPLIED_PRICE InpRegressionPrice      = PRICE_CLOSE;    // Regression Price
+input double          InpRegressionStdDevMult    = 2.0;            // Regression Channel StdDev Multiplier
+input double          InpMinSlopePointsPerBar    = 0.1;            // Minimum Absolute Slope Points/Bar
+input bool            InpRegressionUpdateOnPivot = true;           // Update Only After New Confirmed Pivot
+input bool            InpRegressionProject       = true;           // Project Regression To Current Bar
+input int             InpRegressionAnchorLookbackSwings = 30;      // Anchor Search Lookback Swings
+input bool            InpRegressionUseExtremeAnchor     = true;    // Use Extreme Anchor Low/High
+
+input group "=== Display ==="
+input bool            InpDrawMinorSwings         = true;           // Draw Minor Swing Arrows
+input bool            InpDrawMajorSwings         = true;           // Draw Major Swing Arrows
+input bool            InpDrawZigZag              = true;           // Draw Structural ZigZag
+input bool            InpDrawRegression          = true;           // Draw Regression Line/Channel
+input bool            InpDrawTrendLabel          = true;           // Draw Trend Label
+input color           InpMinorBuyColor           = clrLimeGreen;   // Minor Buy Color
+input color           InpMinorSellColor          = clrDeepPink;    // Minor Sell Color
+input color           InpMajorBuyColor           = clrAqua;        // Major Buy Color
+input color           InpMajorSellColor          = clrOrangeRed;   // Major Sell Color
+input color           InpZigZagColor             = clrGray;        // ZigZag Color
+input int             InpZigZagWidth             = 2;              // ZigZag Width
+input color           InpRegressionColor         = clrGold;        // Regression Line Color
+input color           InpRegressionChannelColor  = clrDimGray;     // Regression Channel Color
+input int             InpRegressionWidth         = 2;              // Regression Width
+input int             InpLabelX                  = 12;             // Trend Label X
+input int             InpLabelY                  = 25;             // Trend Label Y
+input color           InpLabelColor              = clrWhite;       // Trend Label Color
+input int             InpLabelFontSize           = 9;              // Trend Label Font Size
+input string          InpLabelFont               = "Arial";        // Trend Label Font
+
+//+------------------------------------------------------------------+
+//| Buffers                                                          |
+//+------------------------------------------------------------------+
+double BufferMinorBuy[];
+double BufferMinorSell[];
+double BufferMajorBuy[];
+double BufferMajorSell[];
+
+//+------------------------------------------------------------------+
+//| Globals                                                          |
+//+------------------------------------------------------------------+
+ENUM_TIMEFRAMES g_tf = PERIOD_CURRENT;
+string g_tfName = "CURRENT";
+
+int g_hMA1 = INVALID_HANDLE;
+int g_hMA2 = INVALID_HANDLE;
+
+SwingPoint g_minorSwings[];
+SwingPoint g_majorSwings[];
+
+TrendState      g_trend;
+RegressionState g_regression;
+
+datetime g_lastTargetBarTime = 0;
+ulong    g_lastCalcMs = 0;
+
+//+------------------------------------------------------------------+
+//| Helper functions                                                 |
+//+------------------------------------------------------------------+
+int IntMin(int a, int b)
+{
+   return(a < b ? a : b);
+}
+
+int IntMax(int a, int b)
+{
+   return(a > b ? a : b);
+}
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_tf = (InpAnalysisTF == PERIOD_CURRENT) ? _Period : InpAnalysisTF;
+
+   g_tfName = EnumToString(g_tf);
+   StringReplace(g_tfName, "PERIOD_", "");
+
+   SetIndexBuffer(0, BufferMinorBuy,  INDICATOR_DATA);
+   SetIndexBuffer(1, BufferMinorSell, INDICATOR_DATA);
+   SetIndexBuffer(2, BufferMajorBuy,  INDICATOR_DATA);
+   SetIndexBuffer(3, BufferMajorSell, INDICATOR_DATA);
+
+   PlotIndexSetInteger(0, PLOT_ARROW, 158);
+   PlotIndexSetInteger(1, PLOT_ARROW, 158);
+   PlotIndexSetInteger(2, PLOT_ARROW, 158);
+   PlotIndexSetInteger(3, PLOT_ARROW, 158);
+
+   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, 0.0);
+   PlotIndexSetDouble(3, PLOT_EMPTY_VALUE, 0.0);
+
+   ArraySetAsSeries(BufferMinorBuy,  true);
+   ArraySetAsSeries(BufferMinorSell, true);
+   ArraySetAsSeries(BufferMajorBuy,  true);
+   ArraySetAsSeries(BufferMajorSell, true);
+
+   // True MTF: MA handles are created on the analysis timeframe.
+   g_hMA1 = iMA(_Symbol, g_tf, InpBase_MA1_Period, 0, InpBase_MA1_Method, InpBase_MA1_Price);
+   g_hMA2 = iMA(_Symbol, g_tf, InpBase_MA2_Period, 0, InpBase_MA1_Method, InpBase_MA1_Price);
+
+   if(g_hMA1 == INVALID_HANDLE || g_hMA2 == INVALID_HANDLE)
+   {
+      Print("MATRIX V4 Patch: cannot create MA handles on ", g_tfName);
+      return(INIT_FAILED);
+   }
+
+   ZeroMemory(g_trend);
+   ZeroMemory(g_regression);
+
+   g_lastTargetBarTime = 0;
+   g_lastCalcMs = 0;
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization                                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_hMA1 != INVALID_HANDLE)
+      IndicatorRelease(g_hMA1);
+
+   if(g_hMA2 != INVALID_HANDLE)
+      IndicatorRelease(g_hMA2);
+
+   ObjectsDeleteAll(0, "MTF_ZIGZAG_");
+   ObjectsDeleteAll(0, "MATRIX_REG_");
+   ObjectsDeleteAll(0, "MATRIX_TREND_");
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Main calculation                                                 |
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+{
+   if(rates_total < 10)
+      return(0);
+
+   datetime targetBarTime = iTime(_Symbol, g_tf, 0);
+   if(targetBarTime == 0)
+      return(prev_calculated);
+
+   bool newTargetBar = (targetBarTime != g_lastTargetBarTime);
+   bool elapsed = false;
+
+   ulong nowMs = GetTickCount64();
+
+   if(g_lastCalcMs == 0)
+      elapsed = true;
+   else
+      elapsed = (nowMs - g_lastCalcMs >= (ulong)MathMax(1, InpCalcIntervalSeconds) * 1000);
+
+   if(prev_calculated > 0 && !newTargetBar && !elapsed)
+      return(prev_calculated);
+
+   // True MTF data collection.
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   int targetBars = CopyRates(_Symbol, g_tf, 0, InpMaxTargetBars, rates);
+   if(targetBars <= 0)
+      return(prev_calculated);
+
+   int requiredBars = Engine_RequiredBars();
+   if(targetBars < requiredBars)
+      return(prev_calculated);
+
+   double ma1[], ma2[];
+   ArraySetAsSeries(ma1, true);
+   ArraySetAsSeries(ma2, true);
+
+   if(CopyBuffer(g_hMA1, 0, 0, targetBars, ma1) < targetBars)
+      return(prev_calculated);
+
+   if(CopyBuffer(g_hMA2, 0, 0, targetBars, ma2) < targetBars)
+      return(prev_calculated);
+
+   if(prev_calculated == 0 || newTargetBar || g_tf == _Period)
+   {
+      ArrayInitialize(BufferMinorBuy,  0.0);
+      ArrayInitialize(BufferMinorSell, 0.0);
+      ArrayInitialize(BufferMajorBuy,  0.0);
+      ArrayInitialize(BufferMajorSell, 0.0);
+   }
+
+   ArrayResize(g_minorSwings, 0);
+   ArrayResize(g_majorSwings, 0);
+
+   // Locked Swing engine on real target timeframe data.
+   SwingEngine_Detect(rates, ma1, ma2,
+                      InpBase_BarsBefore, InpBase_BarsAfter,
+                      false,
+                      g_minorSwings);
+
+   if(InpUseMajorSwings)
+   {
+      SwingEngine_Detect(rates, ma1, ma2,
+                         InpMajor_BarsBefore, InpMajor_BarsAfter,
+                         true,
+                         g_majorSwings);
+   }
+   else
+   {
+      SwingEngine_Copy(g_minorSwings, g_majorSwings);
+   }
+
+   SwingEngine_SortByTime(g_minorSwings);
+   SwingEngine_SortByTime(g_majorSwings);
+
+   SwingEngine_RemoveDuplicates(g_minorSwings);
+   SwingEngine_RemoveDuplicates(g_majorSwings);
+
+   // Mapping policy:
+   // If analysis TF is the current chart TF, use indicator buffers.
+   // Otherwise use object layer to preserve all target Swings accurately.
+   if(g_tf == _Period)
+   {
+      SwingEngine_MapToBuffers(g_minorSwings, BufferMinorBuy, BufferMinorSell, rates_total);
+      SwingEngine_MapToBuffers(g_majorSwings, BufferMajorBuy, BufferMajorSell, rates_total);
+   }
+
+   // Structural trend engine.
+   if(InpEnableTrend)
+      TrendEngine_Evaluate(g_majorSwings, g_trend);
+   else
+      ZeroMemory(g_trend);
+
+   // Anchored regression validation engine.
+   if(InpEnableRegression)
+      RegressionEngine_Update(g_majorSwings, rates, targetBars, g_trend);
+   else
+      ZeroMemory(g_regression);
+
+   int finalDir = FusionEngine_FinalDirection(g_trend, g_regression);
+
+   if(prev_calculated == 0 || newTargetBar)
+   {
+      if(g_tf != _Period)
+      {
+         ObjectsDeleteAll(0, "MTF_ZIGZAG_" + g_tfName + "_");
+
+         if(InpDrawMinorSwings)
+            Draw_SwingArrows(g_minorSwings, false);
+
+         if(InpDrawMajorSwings)
+            Draw_SwingArrows(g_majorSwings, true);
+
+         if(InpDrawZigZag)
+            Draw_StructuralZigZag(g_majorSwings);
+      }
+
+      ObjectsDeleteAll(0, "MATRIX_REG_");
+      ObjectsDeleteAll(0, "MATRIX_TREND_");
+
+      if(InpDrawRegression)
+         Draw_Regression(g_regression, finalDir);
+
+      if(InpDrawTrendLabel)
+         Draw_TrendLabel(finalDir, g_trend, g_regression);
+
+      ChartRedraw();
+   }
+
+   g_lastCalcMs = nowMs;
+   g_lastTargetBarTime = targetBarTime;
+
+   return(rates_total);
+}
+
+//+------------------------------------------------------------------+
+//| Required target bars                                             |
+//+------------------------------------------------------------------+
+int Engine_RequiredBars()
+{
+   int maxPeriod = IntMax(InpBase_MA1_Period, InpBase_MA2_Period);
+   int maxShift  = IntMax(MathAbs(InpBase_MA1_Shift), MathAbs(InpBase_MA2_Shift));
+   int maxAfter  = IntMax(InpBase_BarsAfter, InpUseMajorSwings ? InpMajor_BarsAfter : 0);
+
+   return(maxPeriod + maxShift + maxAfter + 10);
+}
+
+//+------------------------------------------------------------------+
+//| Oldest valid target bar                                          |
+//|                                                                  |
+//| This corrects historical coverage.                               |
+//| The engine no longer processes only a small recent window.       |
+//+------------------------------------------------------------------+
+int SwingEngine_OldestValidBar(int total)
+{
+   int start = total - 1;
+
+   // MA previous value must exist and be valid.
+   int start1 = total - InpBase_MA1_Period - 1 - InpBase_MA1_Shift;
+   int start2 = total - InpBase_MA2_Period - 1 - InpBase_MA2_Shift;
+
+   start = IntMin(start, start1);
+   start = IntMin(start, start2);
+
+   if(start < 0)
+      start = 0;
+
+   if(start >= total)
+      start = total - 1;
+
+   return(start);
+}
+
+//+------------------------------------------------------------------+
+//| Newest confirmed target bar                                      |
+//|                                                                  |
+//| Confirmation is based on analysis timeframe bars.                |
+//+------------------------------------------------------------------+
+int SwingEngine_NewestConfirmedBar(int barsAfter)
+{
+   int end = barsAfter;
+
+   if(InpStrictNoRepaint)
+      end += 1;
+
+   end = IntMax(end, 0);
+   end = IntMax(end, -InpBase_MA1_Shift);
+   end = IntMax(end, -InpBase_MA2_Shift);
+
+   return(end);
+}
+
+//+------------------------------------------------------------------+
+//| LOCKED SWING ENGINE                                              |
+//|                                                                  |
+//| Mathematical behavior is preserved exactly.                      |
+//+------------------------------------------------------------------+
+void SwingEngine_Detect(const MqlRates &rates[],
+                        const double &ma1[],
+                        const double &ma2[],
+                        int barsBefore,
+                        int barsAfter,
+                        bool majorFlag,
+                        SwingPoint &out[])
+{
+   int total = ArraySize(rates);
+   if(total <= 0)
+      return;
+
+   int start = SwingEngine_OldestValidBar(total);
+   int end   = SwingEngine_NewestConfirmedBar(barsAfter);
+
+   if(start < end)
+      return;
+
+   int rawTypes[];
+   ArrayResize(rawTypes, total);
+   ArrayInitialize(rawTypes, 0);
+
+   // ------------------------------------------------------------
+   // Step 1: raw MA relationship detection
+   // ------------------------------------------------------------
+   for(int i = start; i >= end; i--)
+   {
+      int s1 = i + InpBase_MA1_Shift;
+      int s2 = i + InpBase_MA2_Shift;
+
+      if(s1 < 0 || s2 < 0)
+         continue;
+
+      if(s1 + 1 >= total || s2 + 1 >= total)
+         continue;
+
+      if(ma1[s1] == EMPTY_VALUE || ma1[s1 + 1] == EMPTY_VALUE)
+         continue;
+
+      if(ma2[s2] == EMPTY_VALUE || ma2[s2 + 1] == EMPTY_VALUE)
+         continue;
+
+      double ma1_curr = ma1[s1];
+      double ma1_prev = ma1[s1 + 1];
+      double ma2_curr = ma2[s2];
+      double ma2_prev = ma2[s2 + 1];
+
+      if(ma1_prev <= ma2_prev && ma1_curr > ma2_curr)
+         rawTypes[i] = 1;
+
+      if(ma1_prev >= ma2_prev && ma1_curr < ma2_curr)
+         rawTypes[i] = 2;
+   }
+
+   int minEnd = InpStrictNoRepaint ? 1 : 0;
+
+   // ------------------------------------------------------------
+   // Step 2: confirmation window, clamping, extreme selection
+   // ------------------------------------------------------------
+   for(int i = start; i >= end; i--)
+   {
+      if(rawTypes[i] == 0)
+         continue;
+
+      int startBar = i + barsBefore;
+      int endBar   = i - barsAfter;
+
+      if(startBar >= total)
+         startBar = total - 1;
+
+      if(endBar < minEnd)
+         endBar = minEnd;
+
+      int opposite = (rawTypes[i] == 1) ? 2 : 1;
+
+      // Older boundary clamp.
+      for(int j = i + 1; j <= startBar; j++)
+      {
+         if(rawTypes[j] == opposite)
+         {
+            startBar = j - 1;
+            break;
+         }
+      }
+
+      // Newer boundary clamp.
+      for(int j = i - 1; j >= endBar; j--)
+      {
+         if(rawTypes[j] == opposite)
+         {
+            endBar = j + 1;
+            break;
+         }
+      }
+
+      if(startBar < endBar)
+         continue;
+
+      if(rawTypes[i] == 1)
+      {
+         int    lowestIdx = i;
+         double minLow    = rates[i].low;
+
+         for(int j = startBar; j >= endBar; j--)
+         {
+            if(rates[j].low < minLow)
+            {
+               minLow    = rates[j].low;
+               lowestIdx = j;
+            }
+         }
+
+         SwingEngine_Add(out,
+                         rates[lowestIdx].time,
+                         minLow,
+                         1,
+                         lowestIdx,
+                         majorFlag);
+      }
+      else if(rawTypes[i] == 2)
+      {
+         int    highestIdx = i;
+         double maxHigh    = rates[i].high;
+
+         for(int j = startBar; j >= endBar; j--)
+         {
+            if(rates[j].high > maxHigh)
+            {
+               maxHigh    = rates[j].high;
+               highestIdx = j;
+            }
+         }
+
+         SwingEngine_Add(out,
+                         rates[highestIdx].time,
+                         maxHigh,
+                         2,
+                         highestIdx,
+                         majorFlag);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Add Swing                                                        |
+//+------------------------------------------------------------------+
+void SwingEngine_Add(SwingPoint &out[],
+                     datetime t,
+                     double price,
+                     int type,
+                     int tfBar,
+                     bool majorFlag)
+{
+   int size = ArraySize(out);
+
+   if(size > 0)
+   {
+      if(out[size - 1].time == t && out[size - 1].type == type)
+         return;
+   }
+
+   ArrayResize(out, size + 1);
+
+   out[size].time  = t;
+   out[size].price = price;
+   out[size].type  = type;
+   out[size].tfBar = tfBar;
+   out[size].major = majorFlag;
+}
+
+//+------------------------------------------------------------------+
+//| Copy swings                                                      |
+//+------------------------------------------------------------------+
+void SwingEngine_Copy(const SwingPoint &source[], SwingPoint &dest[])
+{
+   int count = ArraySize(source);
+   ArrayResize(dest, count);
+
+   for(int i = 0; i < count; i++)
+      dest[i] = source[i];
+}
+
+//+------------------------------------------------------------------+
+//| Sort swings by time                                              |
+//+------------------------------------------------------------------+
+void SwingEngine_SortByTime(SwingPoint &arr[])
+{
+   int n = ArraySize(arr);
+   if(n < 2)
+      return;
+
+   bool sorted = true;
+
+   for(int i = 1; i < n; i++)
+   {
+      if(arr[i].time < arr[i - 1].time)
+      {
+         sorted = false;
+         break;
+      }
+   }
+
+   if(sorted)
+      return;
+
+   for(int i = 1; i < n; i++)
+   {
+      SwingPoint key = arr[i];
+      int j = i - 1;
+
+      while(j >= 0 && arr[j].time > key.time)
+      {
+         arr[j + 1] = arr[j];
+         j--;
+      }
+
+      arr[j + 1] = key;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Remove exact duplicates                                          |
+//+------------------------------------------------------------------+
+void SwingEngine_RemoveDuplicates(SwingPoint &arr[])
+{
+   int n = ArraySize(arr);
+   if(n < 2)
+      return;
+
+   SwingPoint tmp[];
+   int count = 0;
+
+   for(int i = 0; i < n; i++)
+   {
+      if(i > 0 && arr[i].time == arr[i - 1].time && arr[i].type == arr[i - 1].type)
+         continue;
+
+      ArrayResize(tmp, count + 1);
+      tmp[count] = arr[i];
+      count++;
+   }
+
+   ArrayResize(arr, count);
+
+   for(int i = 0; i < count; i++)
+      arr[i] = tmp[i];
+}
+
+//+------------------------------------------------------------------+
+//| Map swings to current chart buffers                              |
+//|                                                                  |
+//| Mapping policy:                                                  |
+//| - used only when analysis TF equals current chart TF             |
+//| - Swing time/price/type are not altered                         |
+//| - if multiple Swings map to same bar, newest confirmed wins      |
+//+------------------------------------------------------------------+
+void SwingEngine_MapToBuffers(const SwingPoint &swings[],
+                              double &buyBuffer[],
+                              double &sellBuffer[],
+                              int rates_total)
+{
+   int count = ArraySize(swings);
+
+   for(int i = 0; i < count; i++)
+   {
+      int shift = iBarShift(_Symbol, _Period, swings[i].time, true);
+
+      if(shift < 0)
+         shift = iBarShift(_Symbol, _Period, swings[i].time, false);
+
+      if(shift < 0 || shift >= rates_total)
+         continue;
+
+      buyBuffer[shift]  = 0.0;
+      sellBuffer[shift] = 0.0;
+
+      if(swings[i].type == 1)
+         buyBuffer[shift] = swings[i].price;
+      else if(swings[i].type == 2)
+         sellBuffer[shift] = swings[i].price;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Price comparison helper                                          |
+//+------------------------------------------------------------------+
+int PriceEngine_Compare(double newerPrice, double olderPrice, double minDist)
+{
+   if(newerPrice > olderPrice + minDist)
+      return(1);
+
+   if(newerPrice < olderPrice - minDist)
+      return(-1);
+
+   return(0);
+}
+
+//+------------------------------------------------------------------+
+//| Add structural event                                             |
+//+------------------------------------------------------------------+
+void TrendEngine_AddEvent(int &eventDirs[], int &eventCount, int dir)
+{
+   if(dir == 0)
+      return;
+
+   ArrayResize(eventDirs, eventCount + 1);
+   eventDirs[eventCount] = dir;
+   eventCount++;
+}
+
+//+------------------------------------------------------------------+
+//| Corrected structural trend engine                                |
+//|                                                                  |
+//| Uses chronological HH / HL / LH / LL events.                     |
+//+------------------------------------------------------------------+
+void TrendEngine_Evaluate(const SwingPoint &swings[], TrendState &st)
+{
+   int oldConfirmed = st.confirmedDir;
+
+   st.rawDir = 0;
+   st.bullScore = 0;
+   st.bearScore = 0;
+   st.lastHighRel = 0;
+   st.lastLowRel = 0;
+   st.state = TREND_SIDEWAYS;
+
+   int n = ArraySize(swings);
+   if(n < 3)
+   {
+      st.confirmedDir = oldConfirmed;
+      return;
+   }
+
+   double minDist = InpStructMinDistancePoints * _Point;
+
+   int eventDirs[];
+   int eventCount = 0;
+
+   double lastHigh = 0.0;
+   double lastLow  = 0.0;
+
+   bool hasHigh = false;
+   bool hasLow  = false;
+
+   // Chronological structural event extraction.
+   for(int i = 0; i < n; i++)
+   {
+      if(swings[i].type == 2)
+      {
+         if(hasHigh)
+         {
+            int rel = PriceEngine_Compare(swings[i].price, lastHigh, minDist);
+
+            if(rel != 0)
+            {
+               TrendEngine_AddEvent(eventDirs, eventCount, rel);
+               st.lastHighRel = rel;
+            }
+         }
+
+         lastHigh = swings[i].price;
+         hasHigh = true;
+      }
+      else if(swings[i].type == 1)
+      {
+         if(hasLow)
+         {
+            int rel = PriceEngine_Compare(swings[i].price, lastLow, minDist);
+
+            if(rel != 0)
+            {
+               TrendEngine_AddEvent(eventDirs, eventCount, rel);
+               st.lastLowRel = rel;
+            }
+         }
+
+         lastLow = swings[i].price;
+         hasLow = true;
+      }
+   }
+
+   if(eventCount == 0)
+   {
+      st.confirmedDir = oldConfirmed;
+      return;
+   }
+
+   int start = IntMax(0, eventCount - InpTrendEventLookback);
+
+   for(int i = start; i < eventCount; i++)
+   {
+      if(eventDirs[i] > 0)
+         st.bullScore++;
+      else if(eventDirs[i] < 0)
+         st.bearScore++;
+   }
+
+   int candidate = 0;
+
+   if(st.bullScore >= InpWeakScore &&
+      st.bullScore > st.bearScore + InpDirectionMargin)
+   {
+      candidate = 1;
+   }
+   else if(st.bearScore >= InpWeakScore &&
+           st.bearScore > st.bullScore + InpDirectionMargin)
+   {
+      candidate = -1;
+   }
+
+   st.rawDir = candidate;
+
+   // Basic state classification.
+   if(candidate > 0)
+   {
+      if(st.bullScore >= InpStrongScore)
+         st.state = TREND_STRONG_BULL;
+      else
+         st.state = TREND_BULLISH;
+   }
+   else if(candidate < 0)
+   {
+      if(st.bearScore >= InpStrongScore)
+         st.state = TREND_STRONG_BEAR;
+      else
+         st.state = TREND_BEARISH;
+   }
+   else
+   {
+      if(st.bullScore > 0 && st.bearScore > 0)
+         st.state = TREND_TRANSITION;
+      else
+         st.state = TREND_SIDEWAYS;
+   }
+
+   int confirmed = oldConfirmed;
+
+   if(confirmed == 0)
+   {
+      if(candidate != 0)
+         confirmed = candidate;
+   }
+   else if(candidate == confirmed)
+   {
+      // Trend continuation.
+      confirmed = oldConfirmed;
+   }
+   else if(candidate == -confirmed && candidate != 0)
+   {
+      int oppScore  = (candidate > 0) ? st.bullScore : st.bearScore;
+      int sameScore = (candidate > 0) ? st.bearScore : st.bullScore;
+
+      bool evidence = true;
+
+      if(InpRequireBothSidesForReversal)
+      {
+         if(confirmed > 0)
+            evidence = (st.lastHighRel < 0 && st.lastLowRel < 0);
+         else
+            evidence = (st.lastHighRel > 0 && st.lastLowRel > 0);
+      }
+
+      if(oppScore >= InpReversalScore &&
+         oppScore > sameScore + InpReversalMargin &&
+         evidence)
+      {
+         confirmed = candidate;
+         st.state = TREND_REVERSAL_CANDIDATE;
+      }
+      else
+      {
+         confirmed = oldConfirmed;
+         st.state = TREND_REVERSAL_CANDIDATE;
+      }
+   }
+   else
+   {
+      confirmed = oldConfirmed;
+
+      if(st.bullScore > 0 && st.bearScore > 0)
+         st.state = TREND_TRANSITION;
+   }
+
+   st.confirmedDir = confirmed;
+}
+
+//+------------------------------------------------------------------+
+//| Get applied price from rate                                      |
+//+------------------------------------------------------------------+
+double PriceEngine_Get(const MqlRates &rate, ENUM_APPLIED_PRICE price)
+{
+   switch(price)
+   {
+      case PRICE_OPEN:     return(rate.open);
+      case PRICE_HIGH:     return(rate.high);
+      case PRICE_LOW:      return(rate.low);
+      case PRICE_CLOSE:    return(rate.close);
+      case PRICE_MEDIAN:   return((rate.high + rate.low) / 2.0);
+      case PRICE_TYPICAL:  return((rate.high + rate.low + rate.close) / 3.0);
+      case PRICE_WEIGHTED: return((rate.high + rate.low + rate.close + rate.close) / 4.0);
+   }
+
+   return(rate.close);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize regression anchor                                     |
+//|                                                                  |
+//| Point 1 selection is structural.                                 |
+//| Point 1 is fixed for the current structural leg.                 |
+//+------------------------------------------------------------------+
+bool RegressionEngine_InitializeAnchor(const SwingPoint &swings[],
+                                       int dir,
+                                       datetime &anchorTime,
+                                       double &anchorPrice)
+{
+   int n = ArraySize(swings);
+   if(n < 2)
+      return(false);
+
+   if(dir > 0)
+   {
+      int latestHigh = -1;
+
+      for(int i = n - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 2)
+         {
+            latestHigh = i;
+            break;
+         }
+      }
+
+      if(latestHigh < 0)
+         return(false);
+
+      // If previous confirmed leg was bearish, use the previous bearish
+      // expansion Low as the new bullish anchor when possible.
+      if(g_regression.activeDir == -1 && g_regression.expansionTime != 0)
+      {
+         for(int i = 0; i < latestHigh; i++)
+         {
+            if(swings[i].type == 1 && swings[i].time == g_regression.expansionTime)
+            {
+               anchorTime  = swings[i].time;
+               anchorPrice = swings[i].price;
+               return(true);
+            }
+         }
+      }
+
+      datetime lowerBound = 0;
+
+      if(g_regression.activeDir == -1 && g_regression.anchorTime != 0)
+         lowerBound = g_regression.anchorTime;
+
+      int start = IntMax(0, latestHigh - InpRegressionAnchorLookbackSwings);
+
+      int candidate = -1;
+      double bestPrice = DBL_MAX;
+
+      for(int i = start; i < latestHigh; i++)
+      {
+         if(swings[i].type != 1)
+            continue;
+
+         if(lowerBound != 0 && swings[i].time < lowerBound)
+            continue;
+
+         if(InpRegressionUseExtremeAnchor)
+         {
+            if(swings[i].price < bestPrice)
+            {
+               bestPrice = swings[i].price;
+               candidate = i;
+            }
+         }
+         else
+         {
+            if(candidate < 0)
+               candidate = i;
+         }
+      }
+
+      if(candidate >= 0)
+      {
+         anchorTime  = swings[candidate].time;
+         anchorPrice = swings[candidate].price;
+         return(true);
+      }
+
+      // Fallback: latest Major Low before latest Major High.
+      for(int i = latestHigh - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 1)
+         {
+            anchorTime  = swings[i].time;
+            anchorPrice = swings[i].price;
+            return(true);
+         }
+      }
+
+      return(false);
+   }
+
+   if(dir < 0)
+   {
+      int latestLow = -1;
+
+      for(int i = n - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 1)
+         {
+            latestLow = i;
+            break;
+         }
+      }
+
+      if(latestLow < 0)
+         return(false);
+
+      // If previous confirmed leg was bullish, use the previous bullish
+      // expansion High as the new bearish anchor when possible.
+      if(g_regression.activeDir == 1 && g_regression.expansionTime != 0)
+      {
+         for(int i = 0; i < latestLow; i++)
+         {
+            if(swings[i].type == 2 && swings[i].time == g_regression.expansionTime)
+            {
+               anchorTime  = swings[i].time;
+               anchorPrice = swings[i].price;
+               return(true);
+            }
+         }
+      }
+
+      datetime upperBound = 0;
+
+      if(g_regression.activeDir == 1 && g_regression.anchorTime != 0)
+         upperBound = g_regression.anchorTime;
+
+      int start = IntMax(0, latestLow - InpRegressionAnchorLookbackSwings);
+
+      int candidate = -1;
+      double bestPrice = -DBL_MAX;
+
+      for(int i = start; i < latestLow; i++)
+      {
+         if(swings[i].type != 2)
+            continue;
+
+         if(upperBound != 0 && swings[i].time < upperBound)
+            continue;
+
+         if(InpRegressionUseExtremeAnchor)
+         {
+            if(swings[i].price > bestPrice)
+            {
+               bestPrice = swings[i].price;
+               candidate = i;
+            }
+         }
+         else
+         {
+            if(candidate < 0)
+               candidate = i;
+         }
+      }
+
+      if(candidate >= 0)
+      {
+         anchorTime  = swings[candidate].time;
+         anchorPrice = swings[candidate].price;
+         return(true);
+      }
+
+      // Fallback: latest Major High before latest Major Low.
+      for(int i = latestLow - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 2)
+         {
+            anchorTime  = swings[i].time;
+            anchorPrice = swings[i].price;
+            return(true);
+         }
+      }
+
+      return(false);
+   }
+
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Find regression expansion point                                  |
+//|                                                                  |
+//| Point 2 only.                                                    |
+//| Does NOT move Point 1.                                           |
+//+------------------------------------------------------------------+
+bool RegressionEngine_FindExpansion(const SwingPoint &swings[],
+                                    int dir,
+                                    datetime anchorTime,
+                                    datetime &expansionTime,
+                                    double &expansionPrice)
+{
+   int n = ArraySize(swings);
+
+   if(dir > 0)
+   {
+      for(int i = n - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 2 && swings[i].time > anchorTime)
+         {
+            expansionTime  = swings[i].time;
+            expansionPrice = swings[i].price;
+            return(true);
+         }
+      }
+   }
+   else if(dir < 0)
+   {
+      for(int i = n - 1; i >= 0; i--)
+      {
+         if(swings[i].type == 1 && swings[i].time > anchorTime)
+         {
+            expansionTime  = swings[i].time;
+            expansionPrice = swings[i].price;
+            return(true);
+         }
+      }
+   }
+
+   return(false);
+}
+
+//+------------------------------------------------------------------+
+//| Statistical regression calculation                               |
+//+------------------------------------------------------------------+
+bool RegressionEngine_Calculate(const MqlRates &rates[],
+                                datetime anchorTime,
+                                datetime expansionTime,
+                                double expansionPrice,
+                                int dir)
+{
+   int anchorShift = iBarShift(_Symbol, g_tf, anchorTime, true);
+   int expansionShift = iBarShift(_Symbol, g_tf, expansionTime, true);
+
+   if(anchorShift < 0 || expansionShift < 0)
+      return(false);
+
+   if(anchorShift <= expansionShift)
+      return(false);
+
+   int n = anchorShift - expansionShift + 1;
+
+   if(n < InpRegressionMinBars)
+      return(false);
+
+   if(InpRegressionMaxBars > 0 && n > InpRegressionMaxBars)
+      return(false);
+
+   double sumX = 0.0;
+   double sumY = 0.0;
+   double sumXY = 0.0;
+   double sumXX = 0.0;
+
+   for(int shift = expansionShift; shift <= anchorShift; shift++)
+   {
+      int x = anchorShift - shift;
+      double y = PriceEngine_Get(rates[shift], InpRegressionPrice);
+
+      sumX  += x;
+      sumY  += y;
+      sumXY += x * y;
+      sumXX += x * x;
+   }
+
+   double denom = (double)n * sumXX - sumX * sumX;
+
+   if(MathAbs(denom) < 1e-12)
+      return(false);
+
+   double slope = ((double)n * sumXY - sumX * sumY) / denom;
+   double intercept = (sumY - slope * sumX) / (double)n;
+
+   double sumResid2 = 0.0;
+
+   for(int shift = expansionShift; shift <= anchorShift; shift++)
+   {
+      int x = anchorShift - shift;
+      double y = PriceEngine_Get(rates[shift], InpRegressionPrice);
+      double fitted = intercept + slope * x;
+      double resid = y - fitted;
+      sumResid2 += resid * resid;
+   }
+
+   double stdDev = 0.0;
+
+   if(n > 2)
+      stdDev = MathSqrt(sumResid2 / (double)(n - 2));
+
+   double slopePoints = slope / _Point;
+
+   g_regression.valid = true;
+   g_regression.activeDir = dir;
+   g_regression.expansionTime = expansionTime;
+   g_regression.expansionPrice = expansionPrice;
+   g_regression.slope = slope;
+   g_regression.intercept = intercept;
+   g_regression.stdDev = stdDev;
+   g_regression.slopePointsPerBar = slopePoints;
+
+   if(slopePoints > InpMinSlopePointsPerBar)
+      g_regression.slopeDir = 1;
+   else if(slopePoints < -InpMinSlopePointsPerBar)
+      g_regression.slopeDir = -1;
+   else
+      g_regression.slopeDir = 0;
+
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Regression update                                                |
+//|                                                                  |
+//| Point 1 persists.                                                |
+//| Point 2 expands only with new confirmed Major Swing.             |
+//+------------------------------------------------------------------+
+void RegressionEngine_Update(const SwingPoint &swings[],
+                             const MqlRates &rates[],
+                             int targetBars,
+                             const TrendState &trend)
+{
+   if(!InpEnableRegression)
+      return;
+
+   int dir = trend.confirmedDir;
+
+   if(dir == 0)
+      return;
+
+   // New structural leg: initialize Point 1.
+   if(dir != g_regression.activeDir)
+   {
+      datetime anchorTime;
+      double   anchorPrice;
+
+      if(!RegressionEngine_InitializeAnchor(swings, dir, anchorTime, anchorPrice))
+         return;
+
+      ZeroMemory(g_regression);
+
+      g_regression.activeDir = dir;
+      g_regression.anchorTime = anchorTime;
+      g_regression.anchorPrice = anchorPrice;
+   }
+
+   // Find Point 2.
+   datetime expansionTime;
+   double   expansionPrice;
+
+   if(!RegressionEngine_FindExpansion(swings,
+                                      dir,
+                                      g_regression.anchorTime,
+                                      expansionTime,
+                                      expansionPrice))
+   {
+      return;
+   }
+
+   // Pivot-only update.
+   if(InpRegressionUpdateOnPivot &&
+      g_regression.valid &&
+      expansionTime == g_regression.expansionTime)
+   {
+      return;
+   }
+
+   RegressionEngine_Calculate(rates,
+                              g_regression.anchorTime,
+                              expansionTime,
+                              expansionPrice,
+                              dir);
+}
+
+//+------------------------------------------------------------------+
+//| Fusion engine                                                    |
+//+------------------------------------------------------------------+
+int FusionEngine_FinalDirection(const TrendState &trend,
+                                const RegressionState &reg)
+{
+   if(!InpEnableTrend)
+      return(0);
+
+   int structDir = trend.confirmedDir;
+
+   if(structDir == 0)
+      return(0);
+
+   if(!InpEnableRegression)
+      return(structDir);
+
+   if(!reg.valid)
+      return(0);
+
+   if(reg.activeDir != structDir)
+      return(0);
+
+   if(structDir > 0 && reg.slopeDir > 0)
+      return(1);
+
+   if(structDir < 0 && reg.slopeDir < 0)
+      return(-1);
+
+   return(0);
+}
+
+//+------------------------------------------------------------------+
+//| Draw swing arrows                                                |
+//+------------------------------------------------------------------+
+void Draw_SwingArrows(const SwingPoint &swings[], bool major)
+{
+   int count = ArraySize(swings);
+
+   string section = major ? "_MAJ_" : "_MIN_";
+
+   for(int i = 0; i < count; i++)
+   {
+      string name = "MTF_ZIGZAG_" + g_tfName + section +
+                    IntegerToString((long)swings[i].time) + "_" +
+                    IntegerToString(swings[i].type);
+
+      if(ObjectFind(0, name) >= 0)
+         continue;
+
+      ObjectCreate(0, name, OBJ_ARROW, 0, swings[i].time, swings[i].price);
+      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, 158);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, major ? 3 : 2);
+
+      color arrowColor = clrWhite;
+
+      if(!major)
+         arrowColor = (swings[i].type == 1) ? InpMinorBuyColor : InpMinorSellColor;
+      else
+         arrowColor = (swings[i].type == 1) ? InpMajorBuyColor : InpMajorSellColor;
+
+      ObjectSetInteger(0, name, OBJPROP_COLOR, arrowColor);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw structural ZigZag                                           |
+//+------------------------------------------------------------------+
+void Draw_StructuralZigZag(const SwingPoint &swings[])
+{
+   int count = ArraySize(swings);
+   if(count < 2)
+      return;
+
+   datetime lastTime = 0;
+   double   lastPrice = 0.0;
+   int      lastType = 0;
+
+   for(int i = 0; i < count; i++)
+   {
+      if(lastType != 0 && swings[i].type != lastType)
+      {
+         string name = "MTF_ZIGZAG_" + g_tfName + "_LINE_" +
+                       IntegerToString((long)lastTime) + "_" +
+                       IntegerToString((long)swings[i].time);
+
+         if(ObjectFind(0, name) < 0)
+         {
+            ObjectCreate(0, name, OBJ_TREND, 0,
+                         lastTime, lastPrice,
+                         swings[i].time, swings[i].price);
+
+            ObjectSetInteger(0, name, OBJPROP_COLOR, InpZigZagColor);
+            ObjectSetInteger(0, name, OBJPROP_WIDTH, InpZigZagWidth);
+            ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+            ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+         }
+      }
+
+      lastTime  = swings[i].time;
+      lastPrice = swings[i].price;
+      lastType  = swings[i].type;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Draw regression                                                  |
+//+------------------------------------------------------------------+
+void Draw_Regression(const RegressionState &reg, int finalDir)
+{
+   if(!reg.valid)
+      return;
+
+   int anchorShift = iBarShift(_Symbol, g_tf, reg.anchorTime, true);
+   if(anchorShift < 0)
+      return;
+
+   datetime endTime = reg.expansionTime;
+   int endShift = iBarShift(_Symbol, g_tf, endTime, true);
+
+   if(InpRegressionProject)
+   {
+      endTime = iTime(_Symbol, g_tf, 0);
+      endShift = 0;
+   }
+
+   if(endShift < 0)
+      return;
+
+   double anchorY = reg.intercept;
+   double endY = reg.intercept + reg.slope * (anchorShift - endShift);
+
+   double upperAnchor = anchorY + InpRegressionStdDevMult * reg.stdDev;
+   double lowerAnchor = anchorY - InpRegressionStdDevMult * reg.stdDev;
+
+   double upperEnd = endY + InpRegressionStdDevMult * reg.stdDev;
+   double lowerEnd = endY - InpRegressionStdDevMult * reg.stdDev;
+
+   color lineColor = InpRegressionColor;
+
+   if(finalDir > 0)
+      lineColor = clrLimeGreen;
+   else if(finalDir < 0)
+      lineColor = clrRed;
+
+   Draw_TrendLine("MATRIX_REG_LINE",
+                  reg.anchorTime, anchorY,
+                  endTime, endY,
+                  lineColor,
+                  InpRegressionWidth);
+
+   Draw_TrendLine("MATRIX_REG_UPPER",
+                  reg.anchorTime, upperAnchor,
+                  endTime, upperEnd,
+                  InpRegressionChannelColor,
+                  1);
+
+   Draw_TrendLine("MATRIX_REG_LOWER",
+                  reg.anchorTime, lowerAnchor,
+                  endTime, lowerEnd,
+                  InpRegressionChannelColor,
+                  1);
+}
+
+//+------------------------------------------------------------------+
+//| Draw trend line helper                                           |
+//+------------------------------------------------------------------+
+void Draw_TrendLine(string name,
+                    datetime time1,
+                    double price1,
+                    datetime time2,
+                    double price2,
+                    color lineColor,
+                    int width)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, time1, price1, time2, price2);
+   else
+   {
+      ObjectMove(0, name, 0, time1, price1);
+      ObjectMove(0, name, 1, time2, price2);
+   }
+
+   ObjectSetInteger(0, name, OBJPROP_COLOR, lineColor);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, width);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
+
+//+------------------------------------------------------------------+
+//| Trend state to text                                              |
+//+------------------------------------------------------------------+
+string TrendEngine_StateToString(ENUM_TREND_STATE state)
+{
+   switch(state)
+   {
+      case TREND_SIDEWAYS:            return("SIDEWAYS");
+      case TREND_TRANSITION:          return("TRANSITION");
+      case TREND_WEAK_BULL:           return("WEAK BULL");
+      case TREND_WEAK_BEAR:           return("WEAK BEAR");
+      case TREND_BULLISH:             return("BULLISH");
+      case TREND_BEARISH:             return("BEARISH");
+      case TREND_STRONG_BULL:         return("STRONG BULL");
+      case TREND_STRONG_BEAR:         return("STRONG BEAR");
+      case TREND_REVERSAL_CANDIDATE:  return("REVERSAL CANDIDATE");
+   }
+
+   return("UNKNOWN");
+}
+
+//+------------------------------------------------------------------+
+//| Draw trend label                                                 |
+//+------------------------------------------------------------------+
+void Draw_TrendLabel(int finalDir,
+                     const TrendState &trend,
+                     const RegressionState &reg)
+{
+   string name = "MATRIX_TREND_LABEL";
+
+   string structureText = "NEUTRAL";
+
+   if(trend.confirmedDir > 0)
+      structureText = "BULL STRUCTURE";
+   else if(trend.confirmedDir < 0)
+      structureText = "BEAR STRUCTURE";
+
+   string regText = "REG: OFF";
+
+   if(InpEnableRegression && reg.valid)
+   {
+      if(reg.slopeDir > 0)
+         regText = "REG: +";
+      else if(reg.slopeDir < 0)
+         regText = "REG: -";
+      else
+         regText = "REG: 0";
+   }
+
+   string finalText = "FINAL: NEUTRAL";
+
+   if(finalDir > 0)
+      finalText = "FINAL: BULL";
+   else if(finalDir < 0)
+      finalText = "FINAL: BEAR";
+
+   string text = StringFormat("%s %s | %s | %s | %s",
+                              _Symbol,
+                              g_tfName,
+                              TrendEngine_StateToString(trend.state),
+                              regText,
+                              finalText);
+
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpLabelX);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, InpLabelY);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetString(0, name, OBJPROP_FONT, InpLabelFont);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpLabelFontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, InpLabelColor);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+}
